@@ -1,3 +1,5 @@
+import SR.Sender;
+
 import javax.print.DocFlavor;
 import java.io.*;
 import java.net.Socket;
@@ -5,6 +7,8 @@ import java.net.SocketException;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Scanner;
 
 class Connection {
@@ -19,6 +23,13 @@ class Connection {
     private static final int CHK_SUM_SIZE = 2;
     private static final int SIZE_SIZE = 2;
     private static final int CHUNK_SIZE = 1000;
+
+    private static final int WINDOW_SIZE = 5;
+    private static final int SEQ_NO_INTERVAL = 15;
+
+    public List<Long> ReceiveDrop = new ArrayList<Long>();
+    public List<Long> ReceiveTimeout = new ArrayList<Long>();
+    public List<Long> ReceiveBitErr = new ArrayList<Long>();
 
     public Connection(String host, int ctlPort, int dataPort) throws IOException {
         this.host = host;
@@ -67,6 +78,26 @@ class Connection {
         printRecvControlMessage(recvControlMessage());
     }
 
+    private void send(int seqNo, int CHKsum, int length, byte[] data, boolean timeout, OutputStream out) throws IOException {
+        byte[] chunk = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE + CHUNK_SIZE];
+
+        // make SeqNo
+        chunk[0] = (byte)(seqNo);
+
+        // make CHKSum
+        chunk[SEQ_NO_SIZE + 0] = (byte)((CHKsum >> 8) & 0xFF);
+        chunk[SEQ_NO_SIZE + 1] = (byte)(CHKsum & 0xFF);
+
+        // make Size
+        chunk[SEQ_NO_SIZE + CHK_SUM_SIZE + 0] = (byte)((length >> 8) & 0xFF);
+        chunk[SEQ_NO_SIZE + CHK_SUM_SIZE + 1] = (byte)(length & 0xFF);
+
+        // make Data
+        System.arraycopy(data, 0, chunk, SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE, length);
+
+        out.write(chunk);
+    }
+
     public void sendData(InputStream inp, String name, long length) {
         Socket socket = null;
         try {
@@ -89,68 +120,17 @@ class Connection {
                 return;
             }
 
-            InputStream inStream = socket.getInputStream();
-            OutputStream outStream = socket.getOutputStream();
-
             System.out.println(name + " transferred  / " + length + " bytes");
 
-            long chunkCount = length / CHUNK_SIZE + (length % CHUNK_SIZE > 0 ? 1 : 0);
-            for (long chunkID = 1; chunkID <= chunkCount; ++chunkID) {
-                byte[] chunk = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE + CHUNK_SIZE];
-                int chunkSize = 0;
-
-                // make SeqNo
-                {
-                    chunk[0] = (byte) (chunkID % 16);
-                }
-
-                // make CHKsum
-                {
-                    chunk[SEQ_NO_SIZE + 0] = 0;
-                    chunk[SEQ_NO_SIZE + 1] = 0;
-                }
-
-                // make Size
-                {
-                    final int BASE_IDX = SEQ_NO_SIZE + CHK_SUM_SIZE;
-
-                    if (length >= CHUNK_SIZE * chunkID) {
-                        chunkSize = CHUNK_SIZE;
-                    } else {
-                        chunkSize = (int) (length - CHUNK_SIZE * (chunkID - 1));
-                    }
-
-                    chunk[BASE_IDX + 0] = (byte)((chunkSize >> 8) & 0xFF);
-                    chunk[BASE_IDX + 1] = (byte)(chunkSize & 0xFF);
-                }
-
-                // make Data
-                {
-                    final int BASE_IDX = SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE;
-
-                    inp.read(chunk, BASE_IDX, chunkSize);
-                }
-
-                outStream.write(chunk);
-
-                byte[] resp = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE];
-                inStream.read(resp);
-
-                final int SeqNo = resp[0];
-                final int CHKsum = (resp[SEQ_NO_SIZE + 0] << 8) | resp[SEQ_NO_SIZE + 1];
-
-                if (CHKsum == 0xFF) {
-                    // bit error occurs
-                }
-
-                System.out.print("#");
-            }
-
-            if (inStream != null) inStream.close();
-            if (outStream != null) outStream.close();
+            SR.Sender sender = new Sender(socket, ReceiveDrop, ReceiveTimeout, ReceiveBitErr);
+            sender.send(inp, length);
 
             System.out.println("  Completed...");
-        } catch (IOException e) {
+
+            ReceiveDrop.clear();
+            ReceiveTimeout.clear();
+            ReceiveBitErr.clear();
+        } catch (Exception e) {
             System.out.println("send data failed : " + e.getMessage());
         } finally {
             try {
@@ -175,9 +155,6 @@ class Connection {
                 }
             }
 
-            InputStream inStream = socket.getInputStream();
-            OutputStream outStream = socket.getOutputStream();
-
             String respMsg = recvControlMessage();
             if (!Connection.isSuccess(respMsg)) {
                 Connection.printRecvControlMessage(respMsg);
@@ -190,41 +167,10 @@ class Connection {
 
             FileOutputStream oup = new FileOutputStream(name);
 
-            byte[] buffer = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE + CHUNK_SIZE];
-            while (inStream.read(buffer) != -1) {
-                final int SeqNo = buffer[0];
-                final int CHKsum = ((buffer[1] & 0xFF) << 8) | (buffer[2] & 0xFF);
-                final int Size = ((buffer[3] & 0xFF) << 8) | (buffer[4] & 0xFF);
-
-                if (CHKsum == 0xFFFF) {
-                    // bit error occurs
-                }
-
-                oup.write(buffer, SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE, Size);
-
-                {
-                    byte[] resp = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE];
-
-                    // make SeqNo
-                    {
-                        resp[0] = buffer[0];
-                    }
-
-                    // make CHKsum
-                    {
-                        resp[SEQ_NO_SIZE + 0] = 0;
-                        resp[SEQ_NO_SIZE + 1] = 0;
-                    }
-
-                    outStream.write(resp);
-                }
-
-                System.out.print("#");
-            }
+            SR.Receiver receiver = new SR.Receiver(socket);
+            receiver.recv(oup, length);
 
             if (oup != null) oup.close();
-            if (inStream != null) inStream.close();
-            if (outStream != null) outStream.close();
 
             System.out.println("  Completed...");
         } catch (IOException e) {
@@ -299,12 +245,23 @@ class FTPClient {
                 break;
 
             case "PUT":
-                conn.sendControlMessage(recvMsg);
-                cmd_PUT(tokens);
+                cmd_PUT(tokens, recvMsg);
                 break;
 
             case "QUIT":
                 isRunning = false;
+                break;
+
+            case "DROP":
+                cmd_DROP(tokens);
+                break;
+
+            case "TIMEOUT":
+                cmd_TIMEOUT(tokens);
+                break;
+
+            case "BITERROR":
+                cmd_BITERROR(tokens);
                 break;
 
             default:
@@ -314,7 +271,7 @@ class FTPClient {
         }
     }
 
-    public void cmd_LIST(String[] tokens) throws IOException {
+    private void cmd_LIST(String[] tokens) throws IOException {
         String resp = conn.recvControlMessage();
 
         if (!Connection.isSuccess(resp)) {
@@ -329,7 +286,7 @@ class FTPClient {
         }
     }
 
-    public void cmd_GET(String[] tokens) {
+    private void cmd_GET(String[] tokens) {
         if (tokens.length != 2) {
             System.out.println("syntax error");
             return;
@@ -340,7 +297,7 @@ class FTPClient {
         conn.recvData(name);
     }
 
-    public void cmd_PUT(String[] tokens) throws IOException {
+    private void cmd_PUT(String[] tokens, String recvMsg) throws IOException {
         if (tokens.length != 2) {
             System.out.println("syntax error");
             return;
@@ -350,9 +307,116 @@ class FTPClient {
             FileInputStream inp = new FileInputStream(tokens[1]);
             File file = new File(tokens[1]);
 
+            conn.sendControlMessage(recvMsg);
+
             conn.sendData(inp, file.getName(), file.length());
         } catch (FileNotFoundException e) {
             System.out.println("file not exists");
+        }
+    }
+
+    private void cmd_DROP(String[] tokens) {
+        if (tokens.length != 2) {
+            System.out.println("syntax error");
+            return;
+        }
+
+        String[] argTokens = tokens[1].split(",");
+        List<Long> toSend = new ArrayList<Long>();
+        for (String token : argTokens) {
+            if (token.length() < 2)
+                continue;
+
+            if (token.charAt(0) == 'R') {
+                conn.ReceiveDrop.add(Long.parseLong(token.substring(1)));
+            } else if (token.toUpperCase().charAt(0) == 'S') {
+                toSend.add(Long.parseLong(token.substring(1)));
+            }
+        }
+
+        if (!toSend.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+
+            builder.append("DROP ");
+
+            boolean first = true;
+            for (Long v : toSend) {
+                if (!first)
+                    builder.append(',');
+
+                builder.append(v);
+                first = false;
+            }
+        }
+    }
+
+    private void cmd_TIMEOUT(String[] tokens) {
+        if (tokens.length != 2) {
+            System.out.println("syntax error");
+            return;
+        }
+
+        String[] argTokens = tokens[1].split(",");
+        List<Long> toSend = new ArrayList<Long>();
+        for (String token : argTokens) {
+            if (token.length() < 2)
+                continue;
+
+            if (token.charAt(0) == 'R') {
+                conn.ReceiveTimeout.add(Long.parseLong(token.substring(1)));
+            } else if (token.toUpperCase().charAt(0) == 'S') {
+                toSend.add(Long.parseLong(token.substring(1)));
+            }
+        }
+
+        if (!toSend.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+
+            builder.append("TIMEOUT ");
+
+            boolean first = true;
+            for (Long v : toSend) {
+                if (!first)
+                    builder.append(',');
+
+                builder.append(v);
+                first = false;
+            }
+        }
+    }
+
+    private void cmd_BITERROR(String[] tokens) {
+        if (tokens.length != 2) {
+            System.out.println("syntax error");
+            return;
+        }
+
+        String[] argTokens = tokens[1].split(",");
+        List<Long> toSend = new ArrayList<Long>();
+        for (String token : argTokens) {
+            if (token.length() < 2)
+                continue;
+
+            if (token.toUpperCase().charAt(0) == 'R') {
+                conn.ReceiveBitErr.add(Long.parseLong(token.substring(1)));
+            } else if (token.toUpperCase().charAt(0) == 'S') {
+                toSend.add(Long.parseLong(token.substring(1)));
+            }
+        }
+
+        if (!toSend.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+
+            builder.append("BITERROR ");
+
+            boolean first = true;
+            for (Long v : toSend) {
+                if (!first)
+                    builder.append(',');
+
+                builder.append(v);
+                first = false;
+            }
         }
     }
 

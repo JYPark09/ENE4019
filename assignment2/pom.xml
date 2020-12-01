@@ -5,15 +5,14 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>jypark</groupId>
-    <artifactId>assignment1</artifactId>
+    <artifactId>assignment2</artifactId>
     <version>1.0</version>
+    <packaging>pom</packaging>
 
     <modules>
         <module>FTPServer</module>
         <module>FTPClient</module>
     </modules>
-
-    <packaging>pom</packaging>
 
     <properties>
         <maven.compiler.source>14</maven.compiler.source>

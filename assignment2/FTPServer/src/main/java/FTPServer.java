@@ -3,6 +3,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 class Status {
     public static final int OK = 200;
@@ -127,6 +129,10 @@ class Connection {
     private PrintWriter ctlWriter;
     private BufferedReader ctlReader;
 
+    private List<Long> drop = new ArrayList<Long>();
+    private List<Long> timeout = new ArrayList<Long>();
+    private List<Long> biterror = new ArrayList<Long>();
+
     // Data Channel
     private int dataPort;
 
@@ -225,6 +231,18 @@ class Connection {
 
             case "PUT":
                 cmd_PUT(tokens);
+                break;
+
+            case "DROP":
+                cmd_DROP(tokens);
+                break;
+
+            case "TIMEOUT":
+                cmd_TIMEOUT(tokens);
+                break;
+
+            case "BITERROR":
+                cmd_BITERROR(tokens);
                 break;
 
             default:
@@ -330,9 +348,6 @@ class Connection {
             dataChannel = new ServerSocket(dataPort);
             dataSocket = dataChannel.accept();
 
-            InputStream inStream = dataSocket.getInputStream();
-            OutputStream outStream = dataSocket.getOutputStream();
-
             String tmpDir = getAbsPath(tokens[1]);
             FileInputStream inp = new FileInputStream(tmpDir);
             File file = new File(tmpDir);
@@ -340,58 +355,12 @@ class Connection {
             final long length = file.length();
             sendResponse(new GetSuccessResponse(file));
 
-            long chunkCount = length / CHUNK_SIZE + (length % CHUNK_SIZE > 0 ? 1 : 0);
-            for (long chunkID = 1; chunkID <= chunkCount; ++chunkID) {
-                byte[] chunk = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE + CHUNK_SIZE];
-                int chunkSize = 0;
+            SR.Sender sender = new SR.Sender(dataSocket, drop, timeout, biterror);
+            sender.send(inp, length);
 
-                // make SeqNo
-                {
-                    chunk[0] = (byte) (chunkID % 16);
-                }
-
-                // make CHKsum
-                {
-                    chunk[SEQ_NO_SIZE + 0] = 0;
-                    chunk[SEQ_NO_SIZE + 1] = 0;
-                }
-
-                // make Size
-                {
-                    final int BASE_IDX = SEQ_NO_SIZE + CHK_SUM_SIZE;
-
-                    if (length >= CHUNK_SIZE * chunkID) {
-                        chunkSize = CHUNK_SIZE;
-                    } else {
-                        chunkSize = (int) (length - CHUNK_SIZE * (chunkID - 1));
-                    }
-
-                    chunk[BASE_IDX + 0] = (byte)((chunkSize >> 8) & 0xFF);
-                    chunk[BASE_IDX + 1] = (byte)(chunkSize & 0xFF);
-                }
-
-                // make Data
-                {
-                    final int BASE_IDX = SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE;
-
-                    inp.read(chunk, BASE_IDX, chunkSize);
-                }
-
-                outStream.write(chunk);
-
-                byte[] resp = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE];
-                inStream.read(resp);
-
-                final int SeqNo = resp[0];
-                final int CHKsum = (resp[SEQ_NO_SIZE + 0] << 8) | resp[SEQ_NO_SIZE + 1];
-
-                if (CHKsum == 0xFF) {
-                    // bit error occurs
-                }
-            }
-
-            if (inStream != null) inStream.close();
-            if (outStream != null) outStream.close();
+            drop.clear();
+            timeout.clear();
+            biterror.clear();
         } catch (FileNotFoundException e) {
             sendResponse(new FileNotFoundResponse());
         } catch (Exception e) {
@@ -419,9 +388,6 @@ class Connection {
             dataChannel = new ServerSocket(dataPort);
             dataSocket = dataChannel.accept();
 
-            InputStream inStream = dataSocket.getInputStream();
-            OutputStream outStream = dataSocket.getOutputStream();
-
             final long totalLength = Long.parseLong(ctlReader.readLine());
 
             sendResponse(new ReadyToReceiveResponse());
@@ -430,39 +396,10 @@ class Connection {
 
             FileOutputStream oup = new FileOutputStream(currentDir + "/" + filename);
 
-            byte[] buffer = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE + CHUNK_SIZE];
-            while (inStream.read(buffer) != -1) {
-                final int SeqNo = buffer[0];
-                final int CHKsum = ((buffer[1] & 0xFF) << 8) | (buffer[2] & 0xFF);
-                final int Size = ((buffer[3] & 0xFF) << 8) | (buffer[4] & 0xFF);
-
-                if (CHKsum == 0xFFFF) {
-                    // bit error occurs
-                }
-
-                oup.write(buffer, SEQ_NO_SIZE + CHK_SUM_SIZE + SIZE_SIZE, Size);
-
-                {
-                    byte[] resp = new byte[SEQ_NO_SIZE + CHK_SUM_SIZE];
-
-                    // make SeqNo
-                    {
-                        resp[0] = buffer[0];
-                    }
-
-                    // make CHKsum
-                    {
-                        resp[SEQ_NO_SIZE + 0] = 0;
-                        resp[SEQ_NO_SIZE + 1] = 0;
-                    }
-
-                    outStream.write(resp);
-                }
-            }
+            SR.Receiver receiver = new SR.Receiver(dataSocket);
+            receiver.recv(oup, totalLength);
 
             if (oup != null) oup.close();
-            if (inStream != null) inStream.close();
-            if (outStream != null) outStream.close();
         } catch (Exception e) {
             sendResponse(new UnknownErrResponse());
         } finally {
@@ -472,6 +409,26 @@ class Connection {
             } catch (Exception e) {
                 sendResponse(new UnknownErrResponse());
             }
+        }
+    }
+
+    // DROP, TIMEOUT, BITERROR command must be sent by program.
+    // So, we don't need to check syntax error.
+    private void cmd_DROP(String[] tokens) {
+        for (String token : tokens[1].split(",")) {
+            drop.add(Long.parseLong(token));
+        }
+    }
+
+    private void cmd_TIMEOUT(String[] tokens) {
+        for (String token : tokens[1].split(",")) {
+            timeout.add(Long.parseLong(token));
+        }
+    }
+
+    private void cmd_BITERROR(String[] tokens) {
+        for (String token : tokens[1].split(",")) {
+            biterror.add(Long.parseLong(token));
         }
     }
 }
